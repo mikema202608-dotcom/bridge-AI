@@ -1,0 +1,3 @@
+{$SCHOOL_DOMAIN} {
+    reverse_proxy school:8766
+}
