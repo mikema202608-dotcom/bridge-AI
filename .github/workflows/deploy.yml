@@ -1,0 +1,90 @@
+name: 部署 AI 学习空间
+
+'on':
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ai-learning-production
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Check application syntax
+        run: |
+          python3 -m py_compile server.py
+          node --check client.js
+
+  deploy:
+    needs: check
+    if: ${{ vars.DEPLOY_HOST != '' && vars.DEPLOY_USER != '' && vars.SITE_URL != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Deploy to cloud server
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          : "${DEPLOY_HOST:?Set DEPLOY_HOST}"
+          : "${DEPLOY_USER:?Set DEPLOY_USER}"
+          : "${DEPLOY_SSH_KEY:?Set DEPLOY_SSH_KEY}"
+          : "${DEPLOY_KNOWN_HOSTS:?Set DEPLOY_KNOWN_HOSTS}"
+          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]
+          [[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
+
+          ssh_dir="$(mktemp -d)"
+          trap 'rm -rf "$ssh_dir"' EXIT
+          umask 077
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$ssh_dir/key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+
+          tar -czf - Dockerfile compose.yaml Caddyfile .dockerignore server.py client.js style.css |
+            ssh -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+              -o ConnectTimeout=15 -o UserKnownHostsFile="$ssh_dir/known_hosts" \
+              -i "$ssh_dir/key" -l "$DEPLOY_USER" "$DEPLOY_HOST" '
+                set -eu
+                cd "$HOME/ai-learning-studio"
+                test -s .env
+                stage=$(mktemp -d)
+                trap "rm -rf -- \"$stage\"" EXIT
+                tar -xzf - -C "$stage"
+                docker compose --env-file "$PWD/.env" -f "$stage/compose.yaml" config --quiet
+                for file in Dockerfile compose.yaml Caddyfile .dockerignore server.py client.js style.css; do
+                  if [ ! -f "$file" ] || ! cmp -s "$stage/$file" "$file"; then
+                    cp "$stage/$file" "$file"
+                  fi
+                done
+                docker compose up -d --build --wait --wait-timeout 120
+                docker compose exec -T https caddy reload --config /etc/caddy/Caddyfile
+              '
+      - name: Verify public HTTPS
+        shell: bash
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+        run: |
+          set -euo pipefail
+          : "${SITE_URL:?Set SITE_URL to the public HTTPS address}"
+          [[ "$SITE_URL" =~ ^https://[A-Za-z0-9.-]+/?$ ]]
+          curl --proto '=https' --fail --silent --show-error --max-time 12 \
+            --retry 6 --retry-all-errors --retry-delay 5 "${SITE_URL%/}/api/videos" |
+            python3 -c 'import json, sys; assert isinstance(json.load(sys.stdin), list)'
